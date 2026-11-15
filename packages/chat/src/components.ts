@@ -360,3 +360,9 @@ export {
   getSourceDomains,
   getUniqueDomainSources,
 } from './components/parts/sources';
+
+/** Phase header presentation; hosts retain live activity and fold state. */
+export { default as PhaseMarker, PhaseGlyph } from './components/parts/phase/Marker';
+export type { PhaseMarkerProps, PhaseGlyphProps } from './components/parts/phase/Marker';
+export { default as LivePhaseHeader } from './components/parts/phase/Live';
+export type { LivePhaseHeaderProps } from './components/parts/phase/Live';
