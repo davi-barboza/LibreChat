@@ -201,8 +201,10 @@ configuration.
    validation fails; do not disable signature verification.
 5. Choose **Register or update /librechat commands** on the application card. This explicit
    action upserts the global `/librechat` command without replacing other command names.
-   The command is restricted to server installations and server invocation contexts.
-   Global command changes can take time to appear in Discord.
+   The command is installed with server-installed applications and can be invoked in server
+   channels and in the bot's direct messages. `select`, `ask`, `status` and `cancel` work in a
+   bot DM, as described under direct messages below; `link` and its confirmation work in
+   servers only. Global command changes can take time to appear in Discord.
 6. Choose **Connect server** and complete Discord authorization with an account permitted
    to manage that server. Review the requested bot permissions. Keep the initiating
    LibreChat session open. If the popup is blocked, allow it and refresh server status
@@ -330,6 +332,98 @@ after Discord accepted a message. Refresh run status and inspect the destination
 manually submitting another prompt. Restarting a gateway is not a reason to replay old
 interaction requests or clear deduplication records.
 
+## Health and Metrics
+
+The gateway keeps its probes and adds private observability beside them. Nothing here is
+routed publicly: public ingress exposes `/discord/` only, so keep `/metrics` and
+`/healthz/detail` on the private listener.
+
+`/livez`, `/readyz` and `/healthz` keep their meaning. `/readyz` answers 200 while the process
+is serving and both application discovery and channel discovery are succeeding. A rejected bot
+token, a failing Gateway or a failing worker for one application never makes a shared
+deployment unready, so one tenant's revoked credential cannot restart-loop the gateway.
+
+`GET /healthz/detail` returns aggregate counts and levels, always with HTTP 200 and
+`Cache-Control: no-store`. It names no application, server, channel, user, revision or credential.
+
+```json
+{
+  "status": "ready",
+  "process": { "level": "healthy", "uptimeSeconds": 812 },
+  "workers": { "level": "healthy" },
+  "applications": 3,
+  "quarantined": 0,
+  "credentials": { "disabled": 0, "unknown": 1, "healthy": 2, "degraded": 0, "failing": 0 },
+  "permissions": { "disabled": 0, "unknown": 1, "healthy": 2, "degraded": 0, "failing": 0 },
+  "native": { "disabled": 0, "unknown": 0, "healthy": 2, "degraded": 0, "failing": 1 }
+}
+```
+
+`status` repeats what `/readyz` answers. `process` is `healthy` while serving and `degraded`
+before the gateway is ready and during shutdown. `applications` counts the applications whose
+lease this replica holds, and each of `credentials`, `permissions` and `native` sums to it.
+Exactly one replica owns an application, so summing these across replicas is correct.
+`quarantined` counts held applications this replica does not own. A held application keeps its
+lease, so it appears in `applications` with `native` failing and `quarantined` stays 0.
+
+Levels are computed when read, so silence decays instead of leaving a stale `healthy`. An
+application with no observation inside its window is `unknown`, never `healthy`.
+
+| Concern       | Healthy                                                             | Degraded                                                                                        | Failing                                                                       | Unknown                          | Disabled           |
+| ------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------- | ------------------ |
+| `workers`     | Both discoveries succeeded within `staleAfterMs`                    | A discovery failed for less than `staleAfterMs`, or the last `taskWindow` tasks all failed      | A discovery has failed for `staleAfterMs` or longer                           | Before the first discovery       | Never              |
+| `credentials` | READY, RESUMED or a bot REST 2xx within `observationTtlMs`          | Not used                                                                                        | A bot token REST 401, or Gateway close 4004, since the last positive evidence | No observation within the window | Never              |
+| `permissions` | None of the last `permissionWindow` bot side outcomes denied        | Some denied                                                                                     | All denied                                                                    | No outcome within the window     | Never              |
+| `native`      | Every shard READY or RESUMED with a heartbeat within `staleAfterMs` | A non fatal close, a session gap or a missed heartbeat window, or a stopped session until READY | A fatal stop, until the next READY or a new revision                          | Before the first READY           | The Gateway is off |
+
+Only bot side evidence counts. A message write answered 403 is a denial, and a 404 is neither
+success nor denial because it is what Discord answers for a channel a user deleted. The bot's
+own channel inspection is usable, or denied through a 403 or missing permission bits. Another
+user losing access is never an installation fault, and a rejected interaction callback token
+(a 401 on the interaction reply) says nothing about the bot credential. A credential level is the
+last recorded evidence, not proof of current authorization.
+
+Metrics are on the private `/metrics` listener with the `channel_gateway_discord_` prefix. Every
+label comes from a closed set and any other value is recorded as `other`, so the series stay
+bounded and no label carries an identifier, content or error text.
+
+| Metric                      | Type      | Labels             | Meaning                                                                                                                                                                                               |
+| --------------------------- | --------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ingress_total`             | counter   | `outcome`          | Signed ingress requests: `ping`, `accepted`, `conflict`, `capacity`, `bad_signature`, `bad_payload`, `bad_context`, `unsupported`, `too_large`, `at_capacity`, `deadline`, `unavailable`, `not_found` |
+| `ack_seconds`               | histogram |                    | Time from a matched route to the one response. Discord requires an answer within 3 seconds                                                                                                            |
+| `rest_total`                | counter   | `route`, `status`  | Discord REST requests by route group and status class (`2xx`, `401`, `403`, `404`, `429`, `4xx`, `5xx`, `network`)                                                                                    |
+| `rest_queue_rejected_total` | counter   | `reason`           | Requests the local rate queue refused to start: `queue_full`, `queue_timeout`, `capacity`                                                                                                             |
+| `delivery_total`            | counter   | `kind`, `outcome`  | Delivery attempts: `progress`, `answer`, `trace`, `cleanup` as `confirmed`, `retryable`, `permanent`, `uncertain`                                                                                     |
+| `run_total`                 | counter   | `phase`            | Run lifecycle: `started`, `delivered`, `failed`, `cancelled`                                                                                                                                          |
+| `turn_total`                | counter   | `outcome`          | Channel worker turns: `idle`, `worked`, `held`                                                                                                                                                        |
+| `recovery_total`            | counter   | `event`            | Work recoveries by bounded event, such as `channel_service_unavailable`                                                                                                                               |
+| `gateway_session_total`     | counter   | `event`            | `ready`, `resumed`, `closed_transient`, `closed_fatal`, `gap`, `error`                                                                                                                                |
+| `gateway_stop_total`        | counter   | `reason`           | `shutdown`, `lost`, `credentials`, `configuration`, `identity`, `checkpoint`, `failed`, `backpressure`, `dispatch`                                                                                    |
+| `heartbeat_seconds`         | histogram |                    | Gateway heartbeat acknowledgement latency                                                                                                                                                             |
+| `health`                    | gauge     | `concern`, `level` | Applications per concern and level, read at scrape time (`workers` is one process entity)                                                                                                             |
+| `applications_owned`        | gauge     |                    | Applications whose lease this replica holds                                                                                                                                                           |
+| `applications_quarantined`  | gauge     |                    | Held applications this replica does not own (0 while held applications keep their lease)                                                                                                              |
+
+Useful alerts are `channel_gateway_discord_health{concern="native",level="failing"} > 0` for a
+held Gateway, `channel_gateway_discord_health{concern="credentials",level="failing"} > 0` for a
+rejected bot token, a sustained rate of `ingress_total{outcome="bad_signature"}`, and the
+`ack_seconds` tail approaching 3 seconds. An application that only uses signed slash commands
+never opens a Gateway session, so its credentials stay `unknown` until a bot REST call succeeds.
+
+The windows live under `endpoints.agents.channels.discord.health`. Retry and delay timing stays
+under `gateway.recovery`. Changes take effect when the gateway restarts.
+
+| Setting            | Default   | Range                 | Purpose                                                               |
+| ------------------ | --------- | --------------------- | --------------------------------------------------------------------- |
+| `staleAfterMs`     | `120000`  | `60000` to `3600000`  | Discovery and heartbeat signals older than this stop counting as live |
+| `observationTtlMs` | `3600000` | `60000` to `86400000` | Credential and permission evidence older than this decays to unknown  |
+| `permissionWindow` | `3`       | `1` to `20`           | Recent bot side permission outcomes considered                        |
+| `taskWindow`       | `8`       | `1` to `100`          | Recent worker task outcomes considered                                |
+
+The 60 second minimum of `staleAfterMs` keeps it above Discord's heartbeat interval of about
+41 seconds and not below the longest `gateway.pollIntervalMs`. A shorter window would report
+healthy shards and healthy discovery as stale between signals.
+
 ## Rollback and Uninstall
 
 Disable only `endpoints.agents.channels.discord.enabled` to stop new Discord setup and
@@ -373,8 +467,9 @@ cannot prove real Discord OAuth, command propagation or public proxy configurati
 - Render Compose with `config --quiet`, or render Helm with your values. Confirm separate
   provider Services, matching image tags, private token references and transaction-capable
   MongoDB. Never publish a rendered configuration containing secrets.
-- Check private `/livez` and `/readyz` on the Discord gateway. Confirm public routing exposes
-  `/discord/` only and preserves signed request bytes. Verify the Developer Portal accepts
+- Check private `/livez`, `/readyz`, `/healthz/detail` and `/metrics` on the Discord gateway.
+  Confirm public routing exposes `/discord/` only, so none of them is reachable publicly, and
+  preserves signed request bytes. Verify the Developer Portal accepts
   the application's interactions endpoint, including any public URL prefix rewrite.
 - Add the test application, explicitly register commands, connect the intended server,
   and bind a text channel. Reject a wrong server/channel pair, non-text channel, or bot
