@@ -23,7 +23,17 @@ jest.mock('librechat-data-provider', () => {
     },
   };
 });
-jest.mock('~/hooks', () => ({ useLocalize: () => (key: string) => key }));
+const mockClipboard = jest.fn();
+jest.mock('~/hooks', () => ({
+  useLocalize: () => (key: string) => key,
+  useCopyToClipboard:
+    ({ text }: { text: string }) =>
+    (setCopied: React.Dispatch<React.SetStateAction<boolean>>) => {
+      const copied = mockClipboard(text);
+      if (copied) setCopied(true);
+      return copied;
+    },
+}));
 jest.mock('~/data-provider', () => ({
   useGetAgentByIdQuery: () => ({ data: { name: 'Support agent' } }),
 }));
@@ -71,6 +81,7 @@ async function openCode(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: 'com_ui_discord_dm_generate' }));
 }
 beforeEach(() => {
+  mockClipboard.mockReset().mockReturnValue(true);
   jest.mocked(dataService.channelIdentityClient.list).mockReset().mockResolvedValue([link]);
   jest
     .mocked(dataService.listDiscordDmSelections)
@@ -286,4 +297,20 @@ test('an initial list failure can be retried without issuing a code', async () =
   await f.user.click(await screen.findByRole('button', { name: 'com_ui_retry' }));
   await screen.findByText('com_ui_discord_dm_empty');
   expect(dataService.issueDiscordDmCode).not.toHaveBeenCalled();
+});
+
+test('copies the temporary selection code explicitly and offers manual copy on failure', async () => {
+  const f = page();
+  await openCode(f.user);
+  await f.user.click(await screen.findByRole('button', { name: 'com_ui_discord_dm_copy_code' }));
+  expect(mockClipboard).toHaveBeenCalledWith(secret);
+  expect(screen.getByText('com_ui_copied')).toBeVisible();
+  mockClipboard.mockReturnValue(false);
+  await f.user.click(screen.getByRole('button', { name: 'com_ui_discord_dm_copy_code' }));
+  expect(await screen.findByText('com_ui_channel_handoff_copy_failed')).toBeVisible();
+  expect(screen.getByLabelText('com_ui_discord_dm_code')).toHaveValue(secret);
+  await f.user.click(screen.getByRole('button', { name: 'Cancel' }));
+  expect(
+    screen.queryByRole('button', { name: 'com_ui_discord_dm_copy_code' }),
+  ).not.toBeInTheDocument();
 });
