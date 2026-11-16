@@ -299,12 +299,16 @@ credentials. To resume, make a new selection and send a fresh prompt.
   Do not repair access by manually changing revisions or route records.
 
 Fatal native Gateway stops (rejected bot credentials, invalid shard configuration or intents,
-and identity mismatches) enter a per-process quarantine. Retries start at 30 seconds and double
-to a 15-minute cap. Transient failures use jittered exponential delays capped at 60 seconds.
-A credential revision change bypasses the previous revision's delay immediately; only a
-verified healthy session lasting two minutes resets failure counters. Fix settings in the
-Discord Developer Portal or rotate credentials in LibreChat, rather than repeatedly restarting
-the gateway to clear its local delay.
+and identity mismatches) hold the next Gateway session of that application. Retries start at 30
+seconds and double to a 15-minute cap. Transient failures use jittered exponential delays capped
+at 60 seconds. Only the WebSocket session waits: the application keeps its lease and its REST
+workers, so signed slash commands, private replies and run delivery keep working while the
+Gateway is held out. A credential revision change starts a new owner and a new session at once.
+The delay ladder belongs to one owned application on one replica. It starts again when a
+session that was verified healthy for the reset window below fails, when the application
+revision changes, when the replica stops owning the application, and when the process restarts.
+Fix settings in the Discord Developer Portal or rotate credentials in LibreChat, rather than
+repeatedly restarting the gateway to clear its local delay.
 
 The controls live under `endpoints.agents.channels.discord.gateway.recovery`:
 
@@ -316,9 +320,10 @@ The controls live under `endpoints.agents.channels.discord.gateway.recovery`:
 | `resetAfterMs`           | `120000` | Verified session lifetime needed to reset failure counts        |
 | `maxTrackedApplications` | `4096`   | Bound on active and delayed applications tracked by one process |
 
-When recovery tracking is full, additional applications wait for capacity. An application
-absent from a complete discovery scan releases its delayed slot; a failed discovery page
-does not. Shutdown and lease loss do not quarantine an application.
+When recovery tracking is full, additional applications wait for capacity. A held Gateway
+session keeps its application's slot, so held applications count against `maxApplications`. An
+application absent from a complete discovery scan releases its delayed slot; a failed discovery
+page does not. Shutdown and lease loss do not hold an application.
 
 Delivery records distinguish known failure from an uncertain send. A timeout can happen
 after Discord accepted a message. Refresh run status and inspect the destination before
