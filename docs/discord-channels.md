@@ -457,19 +457,25 @@ rejected bot token, a sustained rate of `ingress_total{outcome="bad_signature"}`
 `ack_seconds` tail approaching 3 seconds. An application that only uses signed slash commands
 never opens a Gateway session, so its credentials stay `unknown` until a bot REST call succeeds.
 
-The windows live under `endpoints.agents.channels.discord.health`. Retry and delay timing stays
-under `gateway.recovery`. Changes take effect when the gateway restarts.
+The windows live under `endpoints.agents.channels.discord.health`. Session retry and delay timing
+stays under `gateway.recovery`; `observationRetryMs` only paces saving a credential observation.
+Changes take effect when the gateway restarts.
 
-| Setting            | Default   | Range                 | Purpose                                                               |
-| ------------------ | --------- | --------------------- | --------------------------------------------------------------------- |
-| `staleAfterMs`     | `120000`  | `60000` to `3600000`  | Discovery and heartbeat signals older than this stop counting as live |
-| `observationTtlMs` | `3600000` | `60000` to `86400000` | Credential and permission evidence older than this decays to unknown  |
-| `permissionWindow` | `3`       | `1` to `20`           | Recent bot side permission outcomes considered                        |
-| `taskWindow`       | `8`       | `1` to `100`          | Recent worker task outcomes considered                                |
+| Setting              | Default   | Range                 | Purpose                                                                                                    |
+| -------------------- | --------- | --------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `staleAfterMs`       | `120000`  | `60000` to `3600000`  | Discovery and heartbeat signals older than this stop counting as live                                      |
+| `observationTtlMs`   | `3600000` | `60000` to `86400000` | Credential and permission evidence older than this decays to unknown                                       |
+| `observationRetryMs` | `30000`   | `1000` to `600000`    | Wait before a credential observation that failed to save is repeated; never longer than `observationTtlMs` |
+| `permissionWindow`   | `3`       | `1` to `20`           | Recent bot side permission outcomes considered                                                             |
+| `taskWindow`         | `8`       | `1` to `100`          | Recent worker task outcomes considered                                                                     |
 
 The 60 second minimum of `staleAfterMs` keeps it above Discord's heartbeat interval of about
 41 seconds and not below the longest `gateway.pollIntervalMs`. A shorter window would report
 healthy shards and healthy discovery as stale between signals.
+
+Credential observations are retried even when no new bot activity arrives. A failed save leaves
+the last recorded status and timestamp unchanged. Deploy matching API and gateway versions,
+upgrading the API first or both together. Mixed API and gateway versions are not supported.
 
 ## Rollback and Uninstall
 
