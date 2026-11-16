@@ -327,6 +327,39 @@ session keeps its application's slot, so held applications count against `maxApp
 application absent from a complete discovery scan releases its delayed slot; a failed discovery
 page does not. Shutdown and lease loss do not hold an application.
 
+A Gateway session must reach READY inside a startup deadline. One startup attempt may take as
+long as its own stage timeouts allow: three times `gateway.handshakeTimeoutMs` (the REST read of
+the session budget, the socket and HELLO) plus `gateway.readyTimeoutMs`, and 6.5 seconds more for
+every further shard, because Discord spaces IDENTIFY calls within a concurrency bucket by 5
+seconds and the SDK adds up to 1.5 seconds of jitter. The defaults give 45 seconds for one shard.
+A session that is not READY by then stops as a transient failure, logs
+`discord_gateway_start_timeout` and waits on the transient ladder above, while the application
+keeps its lease and its REST workers. Tune the deadline through those two settings.
+
+Discord allows 1000 IDENTIFY calls per bot in 24 hours, and exceeding that resets the bot token.
+Every IDENTIFY is therefore counted against the `session_start_limit` that `GET /gateway/bot`
+reports before it is sent, including each one the SDK would send when it reconnects on its own:
+
+- At most `remaining` IDENTIFY calls are sent per window, across all shards. The count starts
+  again when Discord's `reset_after` passes and the limit is read again. RESUME does not spend.
+- A shard never sends a second IDENTIFY before it has reached READY or RESUMED in that session.
+  A Gateway that never answers costs one IDENTIFY per shard per session, and the retry ladder,
+  not the SDK, decides when the next one happens.
+- A limit that is missing, not whole numbers, negative, inconsistent (`remaining` above `total`)
+  or without concurrency is refused, and so is a limit that cannot be read. Nothing is sent.
+- A refused IDENTIFY is never sent. The session stops as a transient failure (a rejected token
+  keeps its own reason) and logs `discord_gateway_identify_refused:<reason>`, where the reason is
+  `exhausted`, `invalid`, `unconfirmed` or `retry`. No token, URL or response body is logged.
+- With the budget exhausted, each start fails without opening a socket until Discord resets it,
+  at the cost of one REST call per retry. The application keeps its lease and REST workers.
+
+The deadline bounds how long one session may take, and the count bounds what it may spend.
+Neither replaces the other. The count covers what this process sends against one read from
+Discord, so it cannot see IDENTIFY calls made by another process with the same bot token: run one
+gateway per application and never share a production token with a development gateway. With the
+default `retryMaxMs` of 60 seconds, a cause that fails every start can still use one IDENTIFY per
+minute until the budget is gone, so fix the cause or raise `retryMaxMs`.
+
 Delivery records distinguish known failure from an uncertain send. A timeout can happen
 after Discord accepted a message. Refresh run status and inspect the destination before
 manually submitting another prompt. Restarting a gateway is not a reason to replay old
