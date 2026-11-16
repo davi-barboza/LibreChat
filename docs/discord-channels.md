@@ -301,26 +301,28 @@ credentials. To resume, make a new selection and send a fresh prompt.
   Do not repair access by manually changing revisions or route records.
 
 Fatal native Gateway stops (rejected bot credentials, invalid shard configuration or intents,
-and identity mismatches) hold the next Gateway session of that application. Retries start at 30
-seconds and double to a 15-minute cap. Transient failures use jittered exponential delays capped
-at 60 seconds. Only the WebSocket session waits: the application keeps its lease and its REST
-workers, so signed slash commands, private replies and run delivery keep working while the
-Gateway is held out. A credential revision change starts a new owner and a new session at once.
-The delay ladder belongs to one owned application on one replica. It starts again when a
-session that was verified healthy for the reset window below fails, when the application
-revision changes, when the replica stops owning the application, and when the process restarts.
+identity mismatches, and a session that cannot start, described below) hold the next Gateway
+session of that application. Retries start at 30 seconds and double to a 15-minute cap. Transient
+failures, such as a failed request or a READY session that fails on an event, a checkpoint or
+backpressure, use jittered exponential delays capped at 60 seconds. Only the WebSocket session
+waits: the application keeps its lease and its REST workers, so signed slash commands, private
+replies and run delivery keep working while the Gateway is held out. A credential revision change
+starts a new owner and a new session at once. The delay ladder belongs to one owned application on
+one replica. It starts again when a session that was verified healthy for the reset window below
+fails, when the application revision changes, when the replica stops owning the application, and
+when the process restarts.
 Fix settings in the Discord Developer Portal or rotate credentials in LibreChat, rather than
 repeatedly restarting the gateway to clear its local delay.
 
 The controls live under `endpoints.agents.channels.discord.gateway.recovery`:
 
-| Setting                  | Default  | Purpose                                                         |
-| ------------------------ | -------- | --------------------------------------------------------------- |
-| `fatalRetryMinMs`        | `30000`  | First retry delay after a fatal stop                            |
-| `fatalRetryMaxMs`        | `900000` | Maximum fatal retry delay                                       |
-| `retryMaxMs`             | `60000`  | Maximum transient retry delay                                   |
-| `resetAfterMs`           | `120000` | Verified session lifetime needed to reset failure counts        |
-| `maxTrackedApplications` | `4096`   | Bound on active and delayed applications tracked by one process |
+| Setting                  | Default  | Purpose                                                             |
+| ------------------------ | -------- | ------------------------------------------------------------------- |
+| `fatalRetryMinMs`        | `30000`  | First retry delay after a fatal stop or a session that cannot start |
+| `fatalRetryMaxMs`        | `900000` | Maximum fatal retry delay                                           |
+| `retryMaxMs`             | `60000`  | Maximum transient retry delay                                       |
+| `resetAfterMs`           | `120000` | Verified session lifetime needed to reset failure counts            |
+| `maxTrackedApplications` | `4096`   | Bound on active and delayed applications tracked by one process     |
 
 When recovery tracking is full, additional applications wait for capacity. A held Gateway
 session keeps its application's slot, so held applications count against `maxApplications`. An
@@ -332,9 +334,9 @@ long as its own stage timeouts allow: three times `gateway.handshakeTimeoutMs` (
 the session budget, the socket and HELLO) plus `gateway.readyTimeoutMs`, and 6.5 seconds more for
 every further shard, because Discord spaces IDENTIFY calls within a concurrency bucket by 5
 seconds and the SDK adds up to 1.5 seconds of jitter. The defaults give 45 seconds for one shard.
-A session that is not READY by then stops as a transient failure, logs
-`discord_gateway_start_timeout` and waits on the transient ladder above, while the application
-keeps its lease and its REST workers. Tune the deadline through those two settings.
+A session that is not READY by then stops as a startup failure, logs
+`discord_gateway_start_timeout` and holds the next session on the fatal ladder above, while the
+application keeps its lease and its REST workers. Tune the deadline through those two settings.
 
 Discord allows 1000 IDENTIFY calls per bot in 24 hours, and exceeding that resets the bot token.
 Every IDENTIFY is therefore counted against the `session_start_limit` that `GET /gateway/bot`
@@ -346,19 +348,31 @@ reports before it is sent, including each one the SDK would send when it reconne
   A Gateway that never answers costs one IDENTIFY per shard per session, and the retry ladder,
   not the SDK, decides when the next one happens.
 - A limit that is missing, not whole numbers, negative, inconsistent (`remaining` above `total`)
-  or without concurrency is refused, and so is a limit that cannot be read. Nothing is sent.
-- A refused IDENTIFY is never sent. The session stops as a transient failure (a rejected token
-  keeps its own reason) and logs `discord_gateway_identify_refused:<reason>`, where the reason is
-  `exhausted`, `invalid`, `unconfirmed` or `retry`. No token, URL or response body is logged.
-- With the budget exhausted, each start fails without opening a socket until Discord resets it,
-  at the cost of one REST call per retry. The application keeps its lease and REST workers.
+  or without concurrency is refused as `invalid`, and nothing is sent. A limit that cannot be read
+  at all, because the request failed, sends nothing either and is an ordinary failure.
+- A refused IDENTIFY is never sent. The session stops as a startup failure and logs
+  `discord_gateway_identify_refused:<reason>`, where the reason is `exhausted`, `invalid` or
+  `retry`. A limit that could not be read is logged as `unconfirmed`, and a rejected token keeps
+  its own reason. No token, URL or response body is logged.
+- With fewer sessions remaining than shards, a start is refused as `exhausted` before it opens a
+  socket or sends an IDENTIFY, at the cost of one REST call per retry. Retries follow the fatal
+  ladder, so at most one every 15 minutes by default, until Discord resets the limit. The delay
+  comes from `gateway.recovery`, never from Discord's `reset_after` or from the failure itself.
+
+A session counts as one that cannot start when it is not READY by its deadline, or when an
+IDENTIFY is refused. Both hold the next session on the fatal ladder and mark the Gateway `failing`
+until the next READY. A session that was READY and then fails for another reason, and a failed
+request, stay on the transient ladder. The credential and permission levels never change for a
+startup failure.
 
 The deadline bounds how long one session may take, and the count bounds what it may spend.
 Neither replaces the other. The count covers what this process sends against one read from
 Discord, so it cannot see IDENTIFY calls made by another process with the same bot token: run one
-gateway per application and never share a production token with a development gateway. With the
-default `retryMaxMs` of 60 seconds, a cause that fails every start can still use one IDENTIFY per
-minute until the budget is gone, so fix the cause or raise `retryMaxMs`.
+gateway per application and never share a production token with a development gateway. Once the
+fatal ladder reaches its cap, a cause that fails every start spends at most one IDENTIFY per shard
+every 15 minutes by default, so at most 96 a day for one shard. A Gateway that never says HELLO
+spends no IDENTIFY but takes the same ladder, so recovery after a long Discord outage can lag by up
+to `fatalRetryMaxMs`: lower it to trade spend for a faster return.
 
 Delivery records distinguish known failure from an uncertain send. A timeout can happen
 after Discord accepted a message. Refresh run status and inspect the destination before
@@ -402,12 +416,12 @@ lease, so it appears in `applications` with `native` failing and `quarantined` s
 Levels are computed when read, so silence decays instead of leaving a stale `healthy`. An
 application with no observation inside its window is `unknown`, never `healthy`.
 
-| Concern       | Healthy                                                             | Degraded                                                                                        | Failing                                                                       | Unknown                          | Disabled           |
-| ------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------- | ------------------ |
-| `workers`     | Both discoveries succeeded within `staleAfterMs`                    | A discovery failed for less than `staleAfterMs`, or the last `taskWindow` tasks all failed      | A discovery has failed for `staleAfterMs` or longer                           | Before the first discovery       | Never              |
-| `credentials` | READY, RESUMED or a bot REST 2xx within `observationTtlMs`          | Not used                                                                                        | A bot token REST 401, or Gateway close 4004, since the last positive evidence | No observation within the window | Never              |
-| `permissions` | None of the last `permissionWindow` bot side outcomes denied        | Some denied                                                                                     | All denied                                                                    | No outcome within the window     | Never              |
-| `native`      | Every shard READY or RESUMED with a heartbeat within `staleAfterMs` | A non fatal close, a session gap or a missed heartbeat window, or a stopped session until READY | A fatal stop, until the next READY or a new revision                          | Before the first READY           | The Gateway is off |
+| Concern       | Healthy                                                             | Degraded                                                                                        | Failing                                                                             | Unknown                          | Disabled           |
+| ------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------- | ------------------ |
+| `workers`     | Both discoveries succeeded within `staleAfterMs`                    | A discovery failed for less than `staleAfterMs`, or the last `taskWindow` tasks all failed      | A discovery has failed for `staleAfterMs` or longer                                 | Before the first discovery       | Never              |
+| `credentials` | READY, RESUMED or a bot REST 2xx within `observationTtlMs`          | Not used                                                                                        | A bot token REST 401, or Gateway close 4004, since the last positive evidence       | No observation within the window | Never              |
+| `permissions` | None of the last `permissionWindow` bot side outcomes denied        | Some denied                                                                                     | All denied                                                                          | No outcome within the window     | Never              |
+| `native`      | Every shard READY or RESUMED with a heartbeat within `staleAfterMs` | A non fatal close, a session gap or a missed heartbeat window, or a stopped session until READY | A fatal stop or a session that cannot start, until the next READY or a new revision | Before the first READY           | The Gateway is off |
 
 Only bot side evidence counts. A message write answered 403 is a denial, and a 404 is neither
 success nor denial because it is what Discord answers for a channel a user deleted. The bot's
@@ -431,7 +445,7 @@ bounded and no label carries an identifier, content or error text.
 | `turn_total`                | counter   | `outcome`          | Channel worker turns: `idle`, `worked`, `held`                                                                                                                                                        |
 | `recovery_total`            | counter   | `event`            | Work recoveries by bounded event, such as `channel_service_unavailable`                                                                                                                               |
 | `gateway_session_total`     | counter   | `event`            | `ready`, `resumed`, `closed_transient`, `closed_fatal`, `gap`, `error`                                                                                                                                |
-| `gateway_stop_total`        | counter   | `reason`           | `shutdown`, `lost`, `credentials`, `configuration`, `identity`, `checkpoint`, `failed`, `backpressure`, `dispatch`                                                                                    |
+| `gateway_stop_total`        | counter   | `reason`           | `shutdown`, `lost`, `credentials`, `configuration`, `identity`, `startup`, `checkpoint`, `failed`, `backpressure`, `dispatch`                                                                         |
 | `heartbeat_seconds`         | histogram |                    | Gateway heartbeat acknowledgement latency                                                                                                                                                             |
 | `health`                    | gauge     | `concern`, `level` | Applications per concern and level, read at scrape time (`workers` is one process entity)                                                                                                             |
 | `applications_owned`        | gauge     |                    | Applications whose lease this replica holds                                                                                                                                                           |
