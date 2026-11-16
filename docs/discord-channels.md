@@ -39,6 +39,43 @@ issue, screenshot or log. Application credentials belong in the authenticated se
 They are encrypted in organization storage and never returned by the setup API. The public
 application ID and verification key are distinct from these secrets.
 
+## Conversation Experience
+
+Account linking can continue on another device. Open the private link from `/librechat link`,
+choose **Use my phone**, and scan the QR code or copy the private link. Sign in on that device,
+review the account and agent, then confirm the account in Discord. The QR code is generated
+locally and carries a short-lived linking ticket, so do not share it. The LibreChat address must
+be reachable from the phone; a `localhost` address only reaches the device displaying it.
+
+While an agent is waiting for a supported tool approval or short choice question, **Review
+request** opens private controls in Discord. The requesting user can approve once, decline,
+or select an answer. Expired or replaced requests cannot be approved. Requests that need a
+larger form or an OAuth sign-in continue in LibreChat. Public progress never contains private
+tool arguments or approval details.
+
+Optional answer previews update the existing progress message while the agent writes.
+They are drafts, not confirmed final answers. Enable them, and complete Markdown downloads
+for answers longer than four inline messages, under the existing Discord policy:
+
+```yaml
+endpoints:
+  agents:
+    channels:
+      discord:
+        streaming:
+          mode: partial
+          maxPreviewChars: 1400
+        longReply:
+          inlineParts: 4
+          maxAttachmentBytes: 1048576
+```
+
+The defaults retain status-only progress (`streaming.mode: status`) and inline delivery
+(`longReply.inlineParts: 0`). Previews contain assistant text only. Markdown delivery keeps
+the complete answer in `reply.md` up to the configured byte limit; larger answers retain the
+existing inline behavior. If delivery cannot be confirmed, use `/librechat status` to open
+the saved session. A delivery warning does not mean the agent's answer was lost.
+
 ## Enable Server Policy
 
 Merge this into the existing `librechat.yaml`; retain the deployment's existing version and
