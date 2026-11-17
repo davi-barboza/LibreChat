@@ -15,8 +15,8 @@ import {
   getScheduleMCPExecution,
   bindScheduledMCPInvocation,
 } from '~/schedules/authorization/execution';
+import { getRemoteRunKeyId, resolveRemoteIntegrations, createAgentKeyMCPGrantHost } from './grants';
 import { createRemoteExecutionContext } from '~/agents/authority/context';
-import { createAgentKeyMCPGrantHost, getRemoteRunKeyId } from './grants';
 import { pinStorage } from '~/schedules/authorization/execution.helper';
 import { getMCPRequestContext } from '~/mcp/request';
 
@@ -183,10 +183,21 @@ afterEach(() => jest.restoreAllMocks());
 
 const refused = (reason: string) => ({ failure: { reason, automaticReplay: false } });
 
-it('leaves key runs as they were unless the operator asks for grants', async () => {
-  for (const integrations of [null, {}, { mode: 'owner', resources: { warehouse: resource } }]) {
+it('leaves key runs as they were only where the operator says so', async () => {
+  const s = setup({ mode: 'owner', resources: { warehouse: resource } });
+  await expect((await s.run()).call()).resolves.toBe('unrestricted');
+  expect(await s.host.service.view(s.identity())).toMatchObject({
+    state: 'unsupported',
+    offer: null,
+  });
+});
+
+it('limits key runs to their grants unless told otherwise, even with nothing declared', async () => {
+  for (const integrations of [null, {}]) {
     const s = setup(integrations);
-    await expect((await s.run()).call()).resolves.toBe('unrestricted');
+    expect(resolveRemoteIntegrations(s.config).mode).toBe('delegated');
+    await expect((await s.run()).call()).rejects.toMatchObject(refused('consent_missing'));
+    // Nothing is declared, so there is nothing the owner could grant.
     expect(await s.host.service.view(s.identity())).toMatchObject({
       state: 'unsupported',
       offer: null,
