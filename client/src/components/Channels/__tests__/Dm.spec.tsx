@@ -295,7 +295,7 @@ test('an initial list failure can be retried without issuing a code', async () =
   jest.mocked(dataService.listDiscordDmSelections).mockRejectedValueOnce(new Error('temporary'));
   const f = page();
   await f.user.click(await screen.findByRole('button', { name: 'com_ui_retry' }));
-  await screen.findByText('com_ui_discord_dm_empty');
+  await screen.findByRole('button', { name: 'com_ui_discord_dm_select_for' });
   expect(dataService.issueDiscordDmCode).not.toHaveBeenCalled();
 });
 
@@ -304,9 +304,9 @@ test('copies the temporary selection code explicitly and offers manual copy on f
   await openCode(f.user);
   await f.user.click(await screen.findByRole('button', { name: 'com_ui_discord_dm_copy_code' }));
   expect(mockClipboard).toHaveBeenCalledWith(secret);
-  expect(screen.getByText('com_ui_copied')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'com_ui_copied' })).toBeVisible();
   mockClipboard.mockReturnValue(false);
-  await f.user.click(screen.getByRole('button', { name: 'com_ui_discord_dm_copy_code' }));
+  await f.user.click(screen.getByRole('button', { name: 'com_ui_copied' }));
   expect(await screen.findByText('com_ui_channel_handoff_copy_failed')).toBeVisible();
   expect(screen.getByLabelText('com_ui_discord_dm_code')).toHaveValue(secret);
   await f.user.click(screen.getByRole('button', { name: 'Cancel' }));
