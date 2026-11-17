@@ -2056,6 +2056,7 @@ async function loadAgentTools({
       description: functionSignature.description,
       streamId,
       jobCreatedAt,
+      unattended: isUnattended(executionContext),
       useSSRFProtection: !Array.isArray(_allowedDomains) || _allowedDomains.length === 0,
       allowedAddresses: _allowedAddresses,
       timeoutMs: getOutboundTimeoutMs(appConfig, 'actionsMs'),
@@ -2508,6 +2509,7 @@ async function loadToolsForExecution({
       appConfig,
       streamId,
       jobCreatedAt,
+      unattended,
       actionToolNames,
       preparedActionSnapshot,
     });
@@ -2561,6 +2563,7 @@ async function loadActionToolsForExecution({
   appConfig,
   streamId,
   jobCreatedAt,
+  unattended,
   actionToolNames,
   preparedActionSnapshot,
 }) {
@@ -2657,6 +2660,7 @@ async function loadActionToolsForExecution({
       action,
       streamId,
       jobCreatedAt,
+      unattended,
       zodSchema,
       encrypted,
       requestBuilder,
