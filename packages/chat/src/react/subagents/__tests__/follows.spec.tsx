@@ -26,6 +26,8 @@ const followed = (overrides: Partial<FollowedChat> = {}): FollowedChat => ({
   isUnattached: false,
   isLoadError: false,
   retry: () => undefined,
+  canSend: () => false,
+  send: () => false,
   ...overrides,
 });
 

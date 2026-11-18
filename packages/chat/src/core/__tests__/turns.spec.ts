@@ -1,8 +1,8 @@
-import { Constants, ContentTypes, EModelEndpoint } from 'librechat-data-provider';
+import { Constants, ContentTypes, createPayload, EModelEndpoint } from 'librechat-data-provider';
 import type { TMessage, TConversation } from 'librechat-data-provider';
-import type { TurnHost, BuildTurnInput } from '../turns';
+import type { SubmittedTurn, BuildTurnInput } from '../turns';
 import type { ExtendedFile } from '../files';
-import { buildTurn, prepareTurn, createRegenerate } from '../turns';
+import { buildTurn, createRegenerate, describeSubmittedTurn, prepareSubmittedTurn } from '../turns';
 import { formatPastedText } from '../files';
 
 const conversationId = 'conversation-1';
@@ -411,146 +411,70 @@ describe('createRegenerate', () => {
   });
 });
 
-describe('prepareTurn', () => {
-  const host = (): TurnHost => {
-    const {
-      text: _text,
-      params: _params,
-      options: _options,
-      latestMessage: _latest,
-      cachedMessages: _cached,
-      ...rest
-    } = input();
-    return rest;
-  };
-  const messages = [user, response];
+describe('a turn ask built, as a Chat takes it', () => {
+  /** The rows `ask` writes before its stream starts, as `useTurns` assembles them. */
+  const submitted = (turn: ReturnType<typeof buildTurn>): SubmittedTurn => ({
+    submission: turn.submission,
+    messages: turn.regenerateShaped
+      ? [...turn.submissionMessages, turn.initialResponse]
+      : [...turn.submissionMessages, turn.currentMsg, turn.initialResponse],
+  });
 
-  it('prepares a submitted message as a new turn after the tail, as ask builds it', () => {
-    const prepared = prepareTurn(
-      {
-        trigger: 'submit-message',
-        chatId: conversationId,
-        messages,
-        input: { parts: [{ type: 'text', text: 'Next question' }] },
-      },
-      host(),
-    );
+  it('posts the body main chat posts for the submission, and shows the rows ask would have', () => {
+    const turn = submitted(buildTurn(input()));
 
+    const prepared = prepareSubmittedTurn(turn);
+
+    expect(prepared.payload).toEqual(createPayload(turn.submission).payload);
     expect(prepared.payload).toMatchObject({
       endpoint: EModelEndpoint.agents,
-      conversationId,
       text: 'Next question',
-      parentMessageId: 'response-1',
-      isContinued: false,
     });
-    expect(prepared.payload.isRegenerate).toBeFalsy();
-    /** What is shown meanwhile: the history, the new user message, then its empty reply. */
-    const shown = prepared.messages as TMessage[];
-    expect(shown.slice(0, 2)).toEqual(messages);
-    expect(shown[2]).toMatchObject({ isCreatedByUser: true, text: 'Next question' });
-    expect(shown[3]).toMatchObject({ isCreatedByUser: false, parentMessageId: shown[2].messageId });
-    expect(prepared.responseMessageId).toBe(shown[3].messageId);
-    /** The same turn the builder gives ask for the same input. */
-    const asked = buildTurn(input());
-    expect(prepared.turn.submission.userMessage.parentMessageId).toBe(
-      asked.submission.userMessage.parentMessageId,
-    );
+    expect(prepared.messages).toBe(turn.messages);
+    /** The reply the chat reports if the turn ends before the server names one. */
+    expect(prepared.responseMessageId).toBe(turn.submission.initialResponse?.messageId);
+    expect(turn.messages[turn.messages.length - 1].messageId).toBe(prepared.responseMessageId);
   });
 
-  it('answers the parent a submitted message names, else the tail of the branch on screen', () => {
-    const later: TMessage = { ...response, messageId: 'response-2', text: 'Another branch' };
-    const submit = (
-      metadata: { parentMessageId?: string } | undefined,
-      latestMessage?: TurnHost['latestMessage'],
-    ) =>
-      prepareTurn(
-        {
-          trigger: 'submit-message',
-          chatId: conversationId,
-          messages: [user, response, later],
-          input: { parts: [{ type: 'text', text: 'Next question' }], metadata },
-        },
-        { ...host(), latestMessage },
-      ).payload.parentMessageId;
+  it('is a submitted message with its text and the parent it answers', () => {
+    const turn = submitted(buildTurn(input()));
 
-    /** With one branch, the last message of the list is its tail. */
-    expect(submit(undefined)).toBe('response-2');
-    expect(submit(undefined, () => response)).toBe('response-1');
-    expect(submit({ parentMessageId: 'response-1' })).toBe('response-1');
-  });
-
-  it('prepares a regeneration that replays the user message the reply answers, with what it was sent with', () => {
-    const prepared = prepareTurn(
-      { trigger: 'regenerate-message', chatId: conversationId, messages, messageId: 'response-1' },
-      host(),
-    );
-
-    expect(prepared.payload).toMatchObject({
-      isRegenerate: true,
-      text: 'Hello',
-      manualSkills: ['skill-a'],
-      quotes: ['quote-a'],
-    });
-    /** No second user message: the empty reply is drawn under the one replayed. */
-    const shown = prepared.messages as TMessage[];
-    expect(shown.filter((message) => message.isCreatedByUser)).toEqual([user]);
-    expect(shown[shown.length - 1]).toMatchObject({
-      isCreatedByUser: false,
-      parentMessageId: 'user-1',
-      messageId: prepared.responseMessageId,
-    });
-    expect(prepared.turn.regenerateShaped).toBe(true);
-  });
-
-  it('prepares a continuation of the reply it names', () => {
-    const later: TMessage = { ...response, messageId: 'response-2', text: 'Another branch' };
-    const prepared = prepareTurn(
-      {
-        trigger: 'continue-message',
-        chatId: conversationId,
-        messages: [user, response, later],
-        messageId: 'response-1',
+    expect(describeSubmittedTurn(turn)).toEqual({
+      trigger: 'submit-message',
+      input: {
+        parts: [{ type: 'text', text: 'Next question' }],
+        metadata: { parentMessageId: 'response-1' },
       },
-      host(),
-    );
-
-    /** What main chat's continue builds when that reply is the one on screen. */
-    const asked = buildTurn(
-      input({
-        params: { ...user },
-        options: { isContinued: true, isRegenerate: true, isEdited: true },
-        latestMessage: response,
-        cachedMessages: [user, response, later],
-      }),
-    );
-    expect(prepared.payload).toMatchObject({
-      isContinued: true,
-      text: 'Hello',
-      responseMessageId: asked.submission.userMessage.responseMessageId,
-      overrideParentMessageId: 'user-1',
     });
-    expect(asked.submission.userMessage.responseMessageId).toContain('response-1');
-    expect(prepared.responseMessageId).toBe(asked.initialResponse.messageId);
   });
 
-  it('refuses to replay a message the list does not hold, or one that answers no user message', () => {
-    const orphan: TMessage = { ...response, messageId: 'orphan', parentMessageId: 'gone' };
-    expect(() =>
-      prepareTurn(
-        { trigger: 'regenerate-message', chatId: conversationId, messages, messageId: 'missing' },
-        host(),
+  it('is a regeneration, or a continuation, of the reply the turn produces', () => {
+    const regenerated = submitted(
+      buildTurn(
+        input({
+          params: { ...user },
+          options: { isRegenerate: true, targetResponseMessageId: 'response-1' },
+        }),
       ),
-    ).toThrow('was not found');
-    expect(() =>
-      prepareTurn(
-        {
-          trigger: 'regenerate-message',
-          chatId: conversationId,
-          messages: [user, orphan],
-          messageId: 'orphan',
-        },
-        host(),
+    );
+    expect(describeSubmittedTurn(regenerated)).toEqual({
+      trigger: 'regenerate-message',
+      messageId: regenerated.submission.initialResponse?.messageId,
+    });
+
+    /** A continuation is regenerate-shaped too; what it is called is decided first. */
+    const continued = submitted(
+      buildTurn(
+        input({
+          params: { ...user },
+          options: { isContinued: true, isRegenerate: true, isEdited: true },
+          latestMessage: response,
+        }),
       ),
-    ).toThrow('was not found');
+    );
+    expect(describeSubmittedTurn(continued)).toEqual({
+      trigger: 'continue-message',
+      messageId: continued.submission.initialResponse?.messageId,
+    });
   });
 });

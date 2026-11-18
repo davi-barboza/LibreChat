@@ -4707,6 +4707,8 @@ describe('SubagentThreadPanel', () => {
       isUnattached: false,
       isLoadError: false,
       retry: jest.fn(),
+      canSend: () => false,
+      send: () => false,
       ...overrides,
     });
 

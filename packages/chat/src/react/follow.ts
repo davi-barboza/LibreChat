@@ -4,12 +4,20 @@ import type { TMessage, ChatEvent } from 'librechat-data-provider';
 import type {
   ChatStatus,
   ChatTransport,
+  SubmittedTurn,
   ChatConnection,
   ChatFinishResult,
   EventApplierInit,
   EventApplierEffect,
 } from '../core';
-import { Chat, MAX_RETRIES, getReconnectDelay, createEventApplier } from '../core';
+import {
+  Chat,
+  MAX_RETRIES,
+  getReconnectDelay,
+  createEventApplier,
+  describeSubmittedTurn,
+  prepareSubmittedTurn,
+} from '../core';
 import { ReactQueryChatState } from './state';
 import { useSnapshot } from './snapshot';
 
@@ -96,9 +104,29 @@ export type FollowedChat = {
   /** Whether the stored messages could not be read; `retry` reads them again. */
   isLoadError: boolean;
   retry: () => void;
+  /**
+   * Whether the conversation can take a turn at this instant: its stored messages are in, and no
+   * generation is being started, followed, looked for or read back. Read when a turn is about to
+   * be built, since the answer a render holds can be a commit old.
+   */
+  canSend: () => boolean;
+  /**
+   * Sends a turn main chat's `ask` built, over the transport's send: the chat shows its rows,
+   * posts its body and applies the generation it starts. False when the chat did not take it,
+   * in which case nothing was shown or posted. A turn whose stream drops is attached to again,
+   * as a followed one is.
+   */
+  send: (turn: SubmittedTurn) => boolean;
 };
 
-type Entry = { id: string; chat: Chat; attach: () => Promise<void>; settle: () => Promise<void> };
+type Entry = {
+  id: string;
+  chat: Chat;
+  attach: () => Promise<void>;
+  settle: () => Promise<void>;
+  canSend: FollowedChat['canSend'];
+  send: FollowedChat['send'];
+};
 type Load = { id: string; attempt: number; state: 'loading' | 'ready' | 'error' };
 /**
  * One attachment: how it ended, unset when nothing was running, and whether it delivered any of
@@ -113,6 +141,7 @@ type Attachment = { finished?: ChatFinishResult; received: boolean };
 export const ABSENT_RETRIES = 2;
 
 const noMessages: TMessage[] = [];
+const refuse = (): boolean => false;
 const unsubscribed = (): (() => void) => () => undefined;
 
 /** One write per frame for streamed tokens, as main chat's step handler coalesces them. */
@@ -126,14 +155,15 @@ const perFrame = (flush: () => void): (() => void) => {
 };
 
 /**
- * Follows one conversation the reader does not drive: shows its stored messages, attaches to the
- * generation running under it and applies that stream the way main chat does, then reads the
- * stored messages again once the generation ends. A stream that drops is not an end: what it
+ * Follows one conversation: shows its stored messages, attaches to the generation running under
+ * it and applies that stream the way main chat does, then reads the stored messages again once
+ * the generation ends. A stream that drops is not an end: what it
  * showed stays, and the attachment is made again on main chat's reconnect schedule. The
  * conversation is a core `Chat` over the message cache, so anything that reads
  * `[QueryKeys.messages, id]` sees what it writes.
  *
- * A subagent's child thread is the first of these; a side chat is the same thing with a send.
+ * A subagent's child thread is one the reader only follows. One the reader drives is the same
+ * thing with `send`, over a transport that can start a generation.
  */
 export function useFollowChat({
   id,
@@ -170,6 +200,10 @@ export function useFollowChat({
     let owed = false;
     let attachment: Attachment | undefined;
     let wake: (() => void) | undefined;
+    /** The turn being handed to the chat, which asks for it back inside the same call. */
+    let handed: SubmittedTurn | undefined;
+    /** Whether a turn sent from here is in flight, which is not an attachment to follow or read over. */
+    let driving = false;
     const applier = createEventApplier({
       schedule: perFrame,
       onEffect: (effect) => host.current.onEffect?.(effect),
@@ -187,7 +221,12 @@ export function useFollowChat({
           host.current.transport.getStatus?.(conversationId) ?? Promise.resolve({ active: false }),
       },
       prepareRequest: () => {
-        throw new Error('A followed conversation takes no turns');
+        const turn = handed;
+        handed = undefined;
+        if (turn == null) {
+          throw new Error('A followed conversation takes the turns `send` hands it, and no others');
+        }
+        return prepareSubmittedTurn(turn);
       },
       applyEvent: applier.applyEvent,
       onEvent: (event) => {
@@ -235,6 +274,11 @@ export function useFollowChat({
      */
     const attach = async (): Promise<void> => {
       if (stale || !loaded) {
+        return;
+      }
+      if (driving) {
+        /** The turn in flight is this chat's own; whatever runs after it is asked for then. */
+        owed = true;
         return;
       }
       if (attaching) {
@@ -293,7 +337,7 @@ export function useFollowChat({
 
     /** The caller saw the run end. A stream still open reads the stored rows itself when it ends. */
     const settle = async (): Promise<void> => {
-      if (stale || !loaded || attaching) {
+      if (stale || !loaded || attaching || driving) {
         return;
       }
       try {
@@ -332,7 +376,66 @@ export function useFollowChat({
       }
     };
 
-    setEntry({ id, chat, attach, settle });
+    const canSend = (): boolean =>
+      !stale &&
+      loaded &&
+      !attaching &&
+      !driving &&
+      (chat.status === 'ready' || chat.status === 'error');
+
+    /**
+     * How a turn sent from here ended decides what follows it. Its own final frame leaves the
+     * result in the list. A stream that dropped leaves the generation running, so it is attached
+     * to again like any other. A turn the server settled without a stream left nothing in the
+     * list, so the stored rows are read.
+     */
+    const conclude = async ({ finished }: Attachment): Promise<void> => {
+      driving = false;
+      if (stale) {
+        return;
+      }
+      if (finished?.isDisconnect === true || owed) {
+        owed = false;
+        await attach();
+        return;
+      }
+      if (finished?.isSettled === true) {
+        await settle();
+      }
+    };
+
+    const send = (turn: SubmittedTurn): boolean => {
+      if (!canSend()) {
+        return false;
+      }
+      const request = describeSubmittedTurn(turn);
+      const current: Attachment = { received: false };
+      handed = turn;
+      let sending: Promise<void>;
+      if (request.trigger === 'submit-message' && request.input != null) {
+        sending = chat.sendMessage(request.input);
+      } else if (request.trigger === 'continue-message' && request.messageId != null) {
+        sending = chat.continue({ messageId: request.messageId });
+      } else {
+        sending = chat.regenerate({ messageId: request.messageId });
+      }
+      /** The chat asks for the turn before the call returns, unless it refused the request. */
+      const taken = handed == null;
+      handed = undefined;
+      if (!taken) {
+        sending.catch(() => undefined);
+        return false;
+      }
+      driving = true;
+      attachment = current;
+      void sending.then(
+        () => conclude(current),
+        () => conclude(current),
+      );
+      return true;
+    };
+
+    setEntry({ id, chat, attach, settle, canSend, send });
     setLoad({ id, attempt, state: 'loading' });
     setFollowing(false);
     setUnattached(false);
@@ -369,6 +472,8 @@ export function useFollowChat({
   const connection = useSnapshot(subscribe, () => chat?.connection ?? 'idle');
   const error = useSnapshot(subscribe, () => chat?.error);
   const retry = useCallback(() => setAttempt((count) => count + 1), []);
+  const canSend = current?.canSend ?? refuse;
+  const send = current?.send ?? refuse;
   const tracked = load.id === id && load.attempt === attempt ? load.state : 'loading';
   const state = enabled ? tracked : 'ready';
 
@@ -383,5 +488,7 @@ export function useFollowChat({
     isUnattached: unattached && current != null,
     isLoadError: state === 'error',
     retry,
+    canSend,
+    send,
   };
 }
