@@ -1,9 +1,10 @@
 import { useMemo } from 'react';
 import { buildTree } from 'librechat-data-provider';
-import type { TConversation } from 'librechat-data-provider';
+import type { TMessage, TConversation } from 'librechat-data-provider';
 import type { ReactElement } from 'react';
 import type { TMessageAuthor } from '../../react/messages/author';
 import type { MessagesHost } from '../../react/messages/host';
+import type { ChatContract } from '../../react/chat/contract';
 import type { ChatScreenMessagesSlots } from './messages';
 import type { FollowedChat } from '../../react/follow';
 import { useMessagesHost, inertSeenSource, MessagesHostProvider } from '../../react/messages/host';
@@ -28,8 +29,9 @@ export type FollowedThreadProps = {
 const none = (): null => null;
 
 /**
- * A followed conversation has no turn of the reader's waiting on it and no steers of theirs, and
- * a surface narrow enough to sit beside a chat has no room for the navigation rail.
+ * A conversation beside the main one has no queued turn of the reader's waiting on it and no
+ * steers of theirs, and a surface narrow enough to sit beside a chat has no room for the
+ * navigation rail.
  */
 const followedSlots: ChatScreenMessagesSlots = {
   renderPendingTurn: none,
@@ -37,14 +39,14 @@ const followedSlots: ChatScreenMessagesSlots = {
   renderNav: none,
 };
 
-/** The followed chat's own list, where the page's host would hand a row main chat's. */
+/** The chat's own list, where the page's host would hand a row main chat's. */
 const useFollowedMessages: MessagesHost['useGetMessages'] = () => useChatContext().getMessages;
 const useNoPendingTurn: MessagesHost['useHasPendingTurn'] = () => false;
 const useNoSeenSource: MessagesHost['useSeenSource'] = () => inertSeenSource;
 
 /**
- * The page's messages host with the members that act on main chat pointed at the followed one:
- * a row reads the followed list, the reader has no queued turn here, and reading it marks no
+ * The page's messages host with the members that act on main chat pointed at this one: a row
+ * reads this chat's list, the reader has no queued turn here, and reading it marks no
  * conversation of theirs seen.
  */
 function useFollowedMessagesHost(): MessagesHost {
@@ -61,22 +63,22 @@ function useFollowedMessagesHost(): MessagesHost {
 }
 
 /**
- * A followed conversation drawn by main chat's own message list: the same thread, rows, parts
- * and scrolling, reading a chat contract built from the followed `Chat`. The hosts those rows
- * read come from the tree it is mounted in, except the three that would act on main chat. It is
- * never the page's main list, so it leaves the page-wide end marker and screenshot target to
- * that one.
+ * A conversation that is not the page's main one, drawn by main chat's own message list: the
+ * same thread, rows, parts and scrolling, reading the chat contract it is given. The hosts those
+ * rows read come from the tree it is mounted in, except the three that would act on main chat.
+ * It leaves the page-wide end marker and screenshot target to the main list.
  */
-export default function FollowedThread({
-  id,
-  followed,
-  index,
-  conversation,
+export function ContractThread({
+  contract,
+  messages,
   slots,
   userAuthor,
-}: FollowedThreadProps): ReactElement {
-  const contract = useFollowedContract({ id, followed, index, conversation });
-  const { messages } = followed;
+}: {
+  contract: ChatContract;
+  messages: TMessage[];
+  slots?: ChatScreenMessagesSlots;
+  userAuthor?: TMessageAuthor;
+}): ReactElement {
   const messagesTree = useMemo(() => buildTree({ messages }), [messages]);
   const listSlots = useMemo(() => ({ ...followedSlots, ...slots }), [slots]);
   const messagesHost = useFollowedMessagesHost();
@@ -93,5 +95,25 @@ export default function FollowedThread({
         </UserTurnAuthorContext.Provider>
       </MessagesHostProvider>
     </ChatContext.Provider>
+  );
+}
+
+/** A conversation the reader follows and does not drive, over a contract that takes no turns. */
+export default function FollowedThread({
+  id,
+  followed,
+  index,
+  conversation,
+  slots,
+  userAuthor,
+}: FollowedThreadProps): ReactElement {
+  const contract = useFollowedContract({ id, followed, index, conversation });
+  return (
+    <ContractThread
+      contract={contract}
+      messages={followed.messages}
+      slots={slots}
+      userAuthor={userAuthor}
+    />
   );
 }

@@ -4,11 +4,12 @@ import type { ParentSubagentIndex, SubagentThreadView, TMessage } from 'librecha
 import type { BrowserContext, Locator, Page } from '@playwright/test';
 import type { AgentDetail } from './agents.helpers';
 import {
+  sendMessage,
+  requestJson,
+  messagesView,
   MOCK_ENDPOINTS,
   getAccessToken,
-  messagesView,
-  requestJson,
-  sendMessage,
+  MOCK_REPLY_TEXT,
   sendMessageAndWaitForCompletion,
 } from './helpers';
 import {
@@ -234,6 +235,111 @@ test.describe('detached subagent activity', () => {
       for (const child of children) {
         await expect(conversationRows.filter({ hasText: `Subagent: ${child.id}` })).toHaveCount(0);
       }
+    } finally {
+      for (const agentId of createdAgentIds.reverse()) {
+        await cleanupAgent(page, agentId);
+      }
+    }
+  });
+  test('continues a finished child as a chat beside the conversation, and answers in it @scenario:subagent-continue-opens-side-chat', async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    const label = `beside-${Date.now().toString(36)}`;
+    /** The fixture's parent dispatches exactly two children; the first is the one continued. */
+    const childNames = [
+      uniqueAgentName('E2E Side Chat Child A'),
+      uniqueAgentName('E2E Side Chat Child B'),
+    ];
+    const parentName = uniqueAgentName('E2E Side Chat Parent');
+    const createdAgentIds: string[] = [];
+    /** Every generation the page starts, by the conversation it is posted for. */
+    const starts: Array<string | null> = [];
+    page.on('request', (request) => {
+      const url = new URL(request.url());
+      if (request.method() === 'POST' && /\/api\/agents\/chat\/[^/]+$/.test(url.pathname)) {
+        const body = request.postDataJSON() as { conversationId?: string | null } | null;
+        if (!url.pathname.endsWith('/abort')) {
+          starts.push(body?.conversationId ?? null);
+        }
+      }
+    });
+
+    try {
+      await page.goto('/c/new');
+      const token = await getAccessToken(page);
+      const children: AgentDetail[] = [];
+      for (const childName of childNames) {
+        const child = await createAgent(page, token, childName);
+        children.push(child);
+        createdAgentIds.push(child.id);
+      }
+      const parent = await createAgent(page, token, parentName, {
+        enabled: true,
+        allowSelf: false,
+        agent_ids: children.map((child) => child.id),
+      });
+      createdAgentIds.push(parent.id);
+
+      await selectAgent(page, parentName);
+      const response = await sendMessageAndWaitForCompletion(
+        page,
+        `${DETACHED_ACTIVITY_MARKER}${children.map((child) => child.id).join(',')}:${label}`,
+      );
+      expect(response.ok()).toBeTruthy();
+      const parentUrl = page.url();
+
+      await page.getByRole('button', { name: 'Ran 2 agents' }).click();
+      const cards = page.locator('[data-subagent-tool-call^="call_e2e_subagent_activity_"]');
+      await expect(cards).toHaveCount(2, { timeout: 30_000 });
+      await cards.first().click();
+      const panel = childActivityPanel(page);
+      await expect(panel).toContainText(`E2E detached child 1 complete ${label}`, {
+        timeout: 30_000,
+      });
+
+      /** A finished child takes no more guidance: what the reader writes continues it as a
+       *  chat of their own, which opens where the child's activity was. */
+      const startsBefore = starts.length;
+      await panel.getByRole('textbox', { name: 'Message input' }).fill('What did you find?');
+      await panel.getByRole('button', { name: 'Continue in a new chat' }).click();
+
+      const sideChat = page.getByRole('region', { name: 'Side chat' });
+      await expect(sideChat).toBeVisible({ timeout: 30_000 });
+      await expect(panel).toHaveCount(0);
+      /** The reader has not left the conversation the child ran under. */
+      expect(page.url()).toBe(parentUrl);
+      const sideConversationId = (await sideChat.getAttribute('data-side-chat')) ?? '';
+      expect(sideConversationId).not.toBe('');
+      expect(parentUrl).not.toContain(sideConversationId);
+
+      /** The child's history came with it, the reader's words are its next turn, and the
+       *  reply streams into the same list. */
+      await expect(sideChat).toContainText(`E2E detached child 1 complete ${label}`);
+      await expect(sideChat).toContainText('What did you find?');
+      await expect(sideChat).toContainText(MOCK_REPLY_TEXT, { timeout: 30_000 });
+      expect(starts.slice(startsBefore)).toEqual([sideConversationId]);
+
+      /** A second turn from the side chat's own composer, once the first has settled. */
+      const composer = sideChat.getByRole('textbox', { name: 'Message input' });
+      await composer.fill('And then?');
+      await expect(sideChat.getByRole('button', { name: 'Send message' })).toBeEnabled({
+        timeout: 30_000,
+      });
+      await composer.press('Enter');
+      await expect(sideChat).toContainText('And then?');
+      await expect
+        .poll(() => starts.slice(startsBefore))
+        .toEqual([sideConversationId, sideConversationId]);
+      await expect(sideChat.getByText(MOCK_REPLY_TEXT)).toHaveCount(2, { timeout: 30_000 });
+
+      /** The same conversation as the page's main one, with both turns stored. */
+      await sideChat.getByRole('button', { name: 'Open as the main chat' }).click();
+      await expect(page).toHaveURL(new RegExp(`/c/${sideConversationId}$`));
+      await expect(sideChat).toHaveCount(0);
+      const main = page.getByRole('main');
+      await expect(main).toContainText('What did you find?');
+      await expect(main).toContainText('And then?');
     } finally {
       for (const agentId of createdAgentIds.reverse()) {
         await cleanupAgent(page, agentId);
