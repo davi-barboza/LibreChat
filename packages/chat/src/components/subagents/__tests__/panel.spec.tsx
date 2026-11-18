@@ -4709,6 +4709,7 @@ describe('SubagentThreadPanel', () => {
       retry: jest.fn(),
       canSend: () => false,
       send: () => false,
+      stop: () => Promise.resolve(),
       ...overrides,
     });
 

@@ -124,6 +124,12 @@ export type FollowedChat = {
    * as a followed one is.
    */
   send: (turn: SubmittedTurn) => boolean;
+  /**
+   * Stops the generation running under the conversation, whoever started it. A turn sent from
+   * here that the server has not answered yet has no generation to name, so it is stopped by its
+   * conversation, and is not attached to again.
+   */
+  stop: () => Promise<void>;
 };
 
 type Entry = {
@@ -133,13 +139,16 @@ type Entry = {
   settle: () => Promise<void>;
   canSend: FollowedChat['canSend'];
   send: FollowedChat['send'];
+  stop: FollowedChat['stop'];
 };
 type Load = { id: string; attempt: number; state: 'loading' | 'ready' | 'error' };
 /**
  * One attachment: how it ended, unset when nothing was running, and whether it delivered any of
- * the generation. The frame that reports a failure is not a delivery.
+ * the generation. The frame that reports a failure is not a delivery. For a turn sent from here,
+ * `foreign` says the server answered it with a generation that is not that turn: one already
+ * running, or a newer one that replaced it.
  */
-type Attachment = { finished?: ChatFinishResult; received: boolean };
+type Attachment = { finished?: ChatFinishResult; received: boolean; foreign?: boolean };
 
 /**
  * How many more times a run the caller knows of is looked for after it was not found. Short: a
@@ -149,6 +158,7 @@ export const ABSENT_RETRIES = 2;
 
 const noMessages: TMessage[] = [];
 const refuse = (): boolean => false;
+const idle = (): Promise<void> => Promise.resolve();
 const unsubscribed = (): (() => void) => () => undefined;
 
 /** One write per frame for streamed tokens, as main chat's step handler coalesces them. */
@@ -223,6 +233,8 @@ export function useFollowChat({
     let driving = false;
     /** Reads of the stored rows in flight, each of which replaces the list when it lands. */
     let reads = 0;
+    /** The reader's stop in flight, which the turn it ends waits for instead of reattaching. */
+    let stopping: Promise<void> | undefined;
     const applier = createEventApplier({
       schedule: perFrame,
       onEffect: (effect) => host.current.onEffect?.(effect),
@@ -233,7 +245,16 @@ export function useFollowChat({
       state: new ReactQueryChatState({ queryClient, key: id }),
       /** Read on every call, so a transport rebuilt for a refreshed token is the one used. */
       transport: {
-        sendMessages: (request) => host.current.transport.sendMessages(request),
+        sendMessages: async (request) => {
+          const turn = attachment;
+          const sent = await host.current.transport.sendMessages(request);
+          if (turn != null) {
+            turn.foreign =
+              sent.status === 'replaced' ||
+              (sent.status === 'stream' && sent.stream.resumed === true);
+          }
+          return sent;
+        },
         reconnectToStream: (request) => host.current.transport.reconnectToStream(request),
         abort: (request) => host.current.transport.abort(request),
         getStatus: (conversationId) =>
@@ -410,17 +431,30 @@ export function useFollowChat({
       (chat.status === 'ready' || chat.status === 'error');
 
     /**
-     * How a turn sent from here ended decides what follows it. A stream that dropped leaves the
-     * generation running, so it is attached to again like any other. A turn the server settled
-     * without a stream left nothing in the list, so the stored rows are read. Otherwise the turn
-     * ended on its own stream and the list is its result, completed the way main chat completes
-     * it: a failure becomes the turn's reply, and a rerun gets back the branches it set aside.
+     * How a turn sent from here ended decides what follows it.
+     *
+     * - Its stream dropped: the generation runs on, so it is attached to again like any other,
+     *   unless the reader's own stop is what dropped it.
+     * - The server settled it without a stream, answered it with a generation that is not this
+     *   turn (one already running, or a newer one that replaced it), or the reader stopped it
+     *   before the server answered: the list is not this turn's to complete, so the stored rows
+     *   are read.
+     * - Otherwise it ended on its own stream and the list is its result, completed the way main
+     *   chat completes it: a failure becomes the turn's reply, and a rerun gets back the
+     *   branches it set aside.
      */
-    const conclude = async (turn: SubmittedTurn, { finished }: Attachment): Promise<void> => {
-      const dropped = finished?.isDisconnect === true;
-      const settled = finished?.isSettled === true;
+    const conclude = async (turn: SubmittedTurn, current: Attachment): Promise<void> => {
+      const { finished } = current;
+      const stopped = stopping;
+      const dropped = finished?.isDisconnect === true && stopped == null;
+      /** Whether the list is this turn's to complete: it ran, as itself, to an end of its own. */
+      const own =
+        current.foreign !== true && finished?.isDisconnect !== true && finished?.isSettled !== true;
       try {
-        if (!stale && !dropped && !settled) {
+        if (stopped != null) {
+          await stopped.catch(() => undefined);
+        }
+        if (!stale && own) {
           const completed =
             finished?.isError === true
               ? failedTurnMessages(turn, chat.messages, chat.error)
@@ -441,9 +475,42 @@ export function useFollowChat({
         await attach();
         return;
       }
-      if (settled) {
+      if (!own) {
         await settle();
       }
+    };
+
+    /**
+     * A stop the chat could not address is a turn the server has not answered: it may be running
+     * with nothing naming it yet. The server finds it by its conversation, and if it only
+     * appears afterwards, by the generation the status route then names.
+     */
+    const stop = (): Promise<void> => {
+      const asked = (async (): Promise<void> => {
+        const result = await chat.stop();
+        const endpoint = host.current.endpoint;
+        if (result.status !== 'unaddressable' || endpoint == null || endpoint === '') {
+          return;
+        }
+        await host.current.transport.abort({ chatId: id, endpoint });
+        const status = await host.current.transport.getStatus?.(id);
+        if (status?.active === true) {
+          await host.current.transport.abort({
+            chatId: id,
+            endpoint,
+            streamId: status.streamId,
+            generationCreatedAt: status.createdAt,
+          });
+        }
+      })();
+      stopping = asked;
+      const done = (): void => {
+        if (stopping === asked) {
+          stopping = undefined;
+        }
+      };
+      asked.then(done, done);
+      return asked;
     };
 
     const send = (turn: SubmittedTurn): boolean => {
@@ -477,7 +544,7 @@ export function useFollowChat({
       return true;
     };
 
-    setEntry({ id, chat, attach, settle, canSend, send });
+    setEntry({ id, chat, attach, settle, canSend, send, stop });
     setLoad({ id, attempt, state: 'loading' });
     setFollowing(false);
     setUnattached(false);
@@ -516,6 +583,7 @@ export function useFollowChat({
   const retry = useCallback(() => setAttempt((count) => count + 1), []);
   const canSend = current?.canSend ?? refuse;
   const send = current?.send ?? refuse;
+  const stop = current?.stop ?? idle;
   const tracked = load.id === id && load.attempt === attempt ? load.state : 'loading';
   const state = enabled ? tracked : 'ready';
 
@@ -532,5 +600,6 @@ export function useFollowChat({
     retry,
     canSend,
     send,
+    stop,
   };
 }

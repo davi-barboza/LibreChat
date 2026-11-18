@@ -45,7 +45,7 @@ const pickTailPlace = (tail: TMessage | null): Pick<TMessage, 'depth' | 'parentM
  */
 export function useDrivenContract({ id, followed, index }: DrivenContractOptions): ChatContract {
   const host = useChatHost();
-  const { chat, status, isLoading, isFollowing, canSend, send } = followed;
+  const { chat, status, isLoading, isFollowing, canSend, send, stop } = followed;
   const [files, setFiles] = useAtom(filesFamily(index));
   const [filesLoading, setFilesLoading] = useState(false);
   const newConversation = host.useNewConversation(index);
@@ -138,9 +138,7 @@ export function useDrivenContract({ id, followed, index }: DrivenContractOptions
     setSiblingIdx,
   });
 
-  const stopGenerating = useCallback(async () => {
-    await chat?.stop();
-  }, [chat]);
+  const stopGenerating = stop;
   const handleStopGenerating = useCallback(
     (e: MouseEvent<HTMLButtonElement>) => {
       e.preventDefault();

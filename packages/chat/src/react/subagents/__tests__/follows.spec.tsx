@@ -28,6 +28,7 @@ const followed = (overrides: Partial<FollowedChat> = {}): FollowedChat => ({
   retry: () => undefined,
   canSend: () => false,
   send: () => false,
+  stop: () => Promise.resolve(),
   ...overrides,
 });
 

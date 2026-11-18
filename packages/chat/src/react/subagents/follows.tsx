@@ -125,6 +125,7 @@ const opening: FollowedChat = {
   retry: () => undefined,
   canSend: () => false,
   send: () => false,
+  stop: () => Promise.resolve(),
 };
 
 const ThreadFollowsContext: Context<ThreadFollows | undefined> = createContext<

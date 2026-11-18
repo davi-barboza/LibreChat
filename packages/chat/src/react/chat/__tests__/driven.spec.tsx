@@ -570,4 +570,105 @@ describe('useDrivenContract', () => {
     expect(refusal).toBeUndefined();
     expect(abort.mock.calls[0]).toMatchObject([{ endpoint: EModelEndpoint.agents }]);
   });
+
+  it('reads the conversation back when the server answered a rerun with a newer generation', async () => {
+    const { result, sendMessages, streams, reconnectToStream, setStatus, loadMessages, ready } =
+      setup();
+    await ready();
+    /** Someone else's turn got there first: the start names the generation that replaced it. */
+    setStatus({ active: true, streamId: conversationId, createdAt: 4000 });
+    sendMessages.mockResolvedValueOnce({
+      status: 'replaced',
+      conversationId,
+      streamId: conversationId,
+      generationCreatedAt: 4000,
+      generationProtocolVersion: 2,
+    });
+
+    act(() => {
+      result.current.contract.regenerate({
+        messageId: 'response-1',
+        parentMessageId: 'user-1',
+        isCreatedByUser: false,
+      });
+    });
+    await waitFor(() => expect(reconnectToStream).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(streams).toHaveLength(1));
+
+    const theirs: TMessage = {
+      ...user,
+      messageId: 'user-2',
+      parentMessageId: 'response-1',
+      text: 'Theirs',
+    };
+    const stored = [user, reply('response-1', 'Hi'), theirs, reply('response-2', 'Done', 'user-2')];
+    loadMessages.mockResolvedValue(stored);
+    setStatus({ active: false });
+    act(() => streams[0].push(final(theirs, reply('response-2', 'Done', 'user-2'))));
+    await waitFor(() => expect(result.current.contract.isSubmitting).toBe(false));
+    await waitFor(() => expect(loadMessages).toHaveBeenCalledTimes(2));
+    await settle();
+
+    /** Their turn whole, and the reply the rerun never replaced: not this turn's snapshot. */
+    expect(ids(result.current.contract.getMessages())).toEqual(ids(stored));
+  });
+
+  it('stops a turn the server has not answered yet by its conversation, and does not follow it', async () => {
+    const { result, sendMessages, abort, reconnectToStream, loadMessages, ready } = setup();
+    await ready();
+    /** The start never answers; cancelling it leaves a generation that may be running unnamed. */
+    sendMessages.mockImplementationOnce(
+      ({ abortSignal }) =>
+        new Promise((_resolve, reject) => {
+          abortSignal?.addEventListener('abort', () => reject(abortSignal.reason), { once: true });
+        }),
+    );
+    act(() => {
+      result.current.contract.ask({ text: 'Next question' });
+    });
+    await waitFor(() => expect(sendMessages).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      await result.current.contract.stopGenerating();
+    });
+
+    expect(abort).toHaveBeenCalledWith({ chatId: conversationId, endpoint: EModelEndpoint.agents });
+    await waitFor(() => expect(result.current.contract.isSubmitting).toBe(false));
+    await waitFor(() => expect(loadMessages).toHaveBeenCalledTimes(2));
+    /** The reader's stop is not a dropped stream: nothing is attached to again. */
+    expect(reconnectToStream).not.toHaveBeenCalled();
+    expect(ids(result.current.contract.getMessages())).toEqual(['user-1', 'response-1']);
+  });
+
+  it('stops by name a generation that appears only after the stop by conversation', async () => {
+    const { result, sendMessages, abort, setStatus, ready } = setup();
+    await ready();
+    sendMessages.mockImplementationOnce(
+      ({ abortSignal }) =>
+        new Promise((_resolve, reject) => {
+          abortSignal?.addEventListener('abort', () => reject(abortSignal.reason), { once: true });
+        }),
+    );
+    act(() => {
+      result.current.contract.ask({ text: 'Next question' });
+    });
+    await waitFor(() => expect(sendMessages).toHaveBeenCalledTimes(1));
+    setStatus({ active: true, streamId: conversationId, createdAt: 5000 });
+
+    await act(async () => {
+      await result.current.contract.stopGenerating();
+    });
+
+    expect(abort.mock.calls).toEqual([
+      [{ chatId: conversationId, endpoint: EModelEndpoint.agents }],
+      [
+        {
+          chatId: conversationId,
+          endpoint: EModelEndpoint.agents,
+          streamId: conversationId,
+          generationCreatedAt: 5000,
+        },
+      ],
+    ]);
+  });
 });
