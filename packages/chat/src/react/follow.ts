@@ -14,9 +14,11 @@ import {
   Chat,
   MAX_RETRIES,
   getReconnectDelay,
+  rerunTurnMessages,
   createEventApplier,
-  describeSubmittedTurn,
+  failedTurnMessages,
   prepareSubmittedTurn,
+  describeSubmittedTurn,
 } from '../core';
 import { ReactQueryChatState } from './state';
 import { useSnapshot } from './snapshot';
@@ -40,6 +42,11 @@ export type FollowChatOptions = {
   live?: boolean;
   /** False follows nothing: no read, no stream, and an idle result. */
   enabled?: boolean;
+  /**
+   * The endpoint the conversation runs on, which a stop of a generation this chat did not start
+   * is addressed to. A chat that only follows needs none.
+   */
+  endpoint?: string | null;
   /** Live status a step reports beside the message list. */
   onEffect?: (effect: EventApplierEffect) => void;
   /**
@@ -171,14 +178,24 @@ export function useFollowChat({
   loadMessages,
   live = false,
   enabled = true,
+  endpoint,
   onEffect,
   beside,
   onEvent,
   onFinish,
 }: FollowChatOptions): FollowedChat {
   const queryClient = useQueryClient();
-  const host = useRef({ transport, loadMessages, live, onEffect, beside, onEvent, onFinish });
-  host.current = { transport, loadMessages, live, onEffect, beside, onEvent, onFinish };
+  const host = useRef({
+    transport,
+    loadMessages,
+    live,
+    endpoint,
+    onEffect,
+    beside,
+    onEvent,
+    onFinish,
+  });
+  host.current = { transport, loadMessages, live, endpoint, onEffect, beside, onEvent, onFinish };
   const [attempt, setAttempt] = useState(0);
   const [entry, setEntry] = useState<Entry>();
   const [load, setLoad] = useState<Load>({ id, attempt, state: 'loading' });
@@ -204,6 +221,8 @@ export function useFollowChat({
     let handed: SubmittedTurn | undefined;
     /** Whether a turn sent from here is in flight, which is not an attachment to follow or read over. */
     let driving = false;
+    /** Reads of the stored rows in flight, each of which replaces the list when it lands. */
+    let reads = 0;
     const applier = createEventApplier({
       schedule: perFrame,
       onEffect: (effect) => host.current.onEffect?.(effect),
@@ -229,6 +248,7 @@ export function useFollowChat({
         return prepareSubmittedTurn(turn);
       },
       applyEvent: applier.applyEvent,
+      resumeSelection: () => ({ endpoint: host.current.endpoint }),
       onEvent: (event) => {
         if (attachment != null && event.type !== 'error') {
           attachment.received = true;
@@ -260,9 +280,14 @@ export function useFollowChat({
     };
 
     const read = async (): Promise<void> => {
-      const messages = await host.current.loadMessages();
-      if (!stale) {
-        await chat.setMessages(messages);
+      reads += 1;
+      try {
+        const messages = await host.current.loadMessages();
+        if (!stale) {
+          await chat.setMessages(messages);
+        }
+      } finally {
+        reads -= 1;
       }
     };
 
@@ -381,25 +406,42 @@ export function useFollowChat({
       loaded &&
       !attaching &&
       !driving &&
+      reads === 0 &&
       (chat.status === 'ready' || chat.status === 'error');
 
     /**
-     * How a turn sent from here ended decides what follows it. Its own final frame leaves the
-     * result in the list. A stream that dropped leaves the generation running, so it is attached
-     * to again like any other. A turn the server settled without a stream left nothing in the
-     * list, so the stored rows are read.
+     * How a turn sent from here ended decides what follows it. A stream that dropped leaves the
+     * generation running, so it is attached to again like any other. A turn the server settled
+     * without a stream left nothing in the list, so the stored rows are read. Otherwise the turn
+     * ended on its own stream and the list is its result, completed the way main chat completes
+     * it: a failure becomes the turn's reply, and a rerun gets back the branches it set aside.
      */
-    const conclude = async ({ finished }: Attachment): Promise<void> => {
-      driving = false;
+    const conclude = async (turn: SubmittedTurn, { finished }: Attachment): Promise<void> => {
+      const dropped = finished?.isDisconnect === true;
+      const settled = finished?.isSettled === true;
+      try {
+        if (!stale && !dropped && !settled) {
+          const completed =
+            finished?.isError === true
+              ? failedTurnMessages(turn, chat.messages, chat.error)
+              : rerunTurnMessages(turn, finished?.message);
+          if (completed != null) {
+            await chat.setMessages(completed);
+          }
+        }
+      } finally {
+        /** Only now can another turn be built: on the list this one left, not the one before it. */
+        driving = false;
+      }
       if (stale) {
         return;
       }
-      if (finished?.isDisconnect === true || owed) {
+      if (dropped || owed) {
         owed = false;
         await attach();
         return;
       }
-      if (finished?.isSettled === true) {
+      if (settled) {
         await settle();
       }
     };
@@ -429,8 +471,8 @@ export function useFollowChat({
       driving = true;
       attachment = current;
       void sending.then(
-        () => conclude(current),
-        () => conclude(current),
+        () => conclude(turn, current),
+        () => conclude(turn, current),
       );
       return true;
     };

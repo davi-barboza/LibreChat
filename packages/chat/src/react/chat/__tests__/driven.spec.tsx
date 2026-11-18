@@ -211,6 +211,7 @@ function setup({
         transport: harness.transport,
         loadMessages,
         live,
+        endpoint: conversation.endpoint,
       });
       const contract = useDrivenContract({
         id: conversationId,
@@ -438,5 +439,135 @@ describe('useDrivenContract', () => {
     expect(services.releaseFiles).not.toHaveBeenCalled();
     expect(store.get(filesFamily(SIDE_PANE))).toBe(staged);
     expect(store.get(isSubmittingFamily(SIDE_PANE))).toBe(false);
+  });
+
+  it('takes no turn while the stored messages are being read back', async () => {
+    const { result, sendMessages, loadMessages, ready } = setup();
+    await ready();
+    const stored = [user, reply('response-1', 'Hi'), reply('response-2', 'Already answered')];
+    let land: (messages: TMessage[]) => void = () => undefined;
+    loadMessages.mockReturnValue(
+      new Promise<TMessage[]>((resolve) => {
+        land = resolve;
+      }),
+    );
+    sendMessages.mockResolvedValueOnce({
+      status: 'settled',
+      conversationId,
+      generationProtocolVersion: 2,
+    });
+    act(() => {
+      result.current.contract.ask({ text: 'Next question' });
+    });
+    await waitFor(() => expect(loadMessages).toHaveBeenCalledTimes(2));
+    await settle();
+
+    /** The turn is over and nothing streams, but the list is about to be replaced. */
+    expect(result.current.followed.status).toBe('ready');
+    expect(result.current.followed.canSend()).toBe(false);
+    let asked: unknown;
+    act(() => {
+      asked = result.current.contract.ask({ text: 'Too soon' });
+    });
+    expect(asked).toBe(false);
+    expect(sendMessages).toHaveBeenCalledTimes(1);
+
+    await act(async () => land(stored));
+    await waitFor(() => expect(result.current.followed.canSend()).toBe(true));
+    expect(ids(result.current.contract.getMessages())).toEqual(ids(stored));
+  });
+
+  it('leaves a refused start as the reply to its message, and takes the next turn', async () => {
+    const { result, sendMessages, streams, ready } = setup();
+    await ready();
+    sendMessages.mockRejectedValueOnce(
+      Object.assign(new Error('Request failed with status code 403'), {
+        response: { status: 403, data: { message: 'Not allowed' }, headers: {} },
+      }),
+    );
+
+    act(() => {
+      result.current.contract.ask({ text: 'Next question' });
+    });
+    await waitFor(() => expect(result.current.contract.isSubmitting).toBe(false));
+    await settle();
+
+    /** Main chat's rows for a start the server refused: the message, and the refusal under it. */
+    const failed = result.current.contract.getMessages() ?? [];
+    expect(ids(failed).slice(0, 2)).toEqual(['user-1', 'response-1']);
+    expect(failed).toHaveLength(4);
+    expect(failed[2]).toMatchObject({ isCreatedByUser: true, text: 'Next question' });
+    expect(failed[3]).toMatchObject({
+      error: true,
+      parentMessageId: failed[2].messageId,
+      metadata: { streamStartFailed: true },
+    });
+    expect(failed[3].text).toContain('Not allowed');
+
+    /** Not a reply still on its way, so the conversation takes another message. */
+    let asked: unknown;
+    act(() => {
+      asked = result.current.contract.ask({ text: 'Again' });
+    });
+    expect(asked).not.toBe(false);
+    await waitFor(() => expect(streams).toHaveLength(1));
+    expect(sendMessages.mock.calls[1][0].payload).toMatchObject({ text: 'Again' });
+  });
+
+  it('gives a rerun back the branches it set aside once its reply is in', async () => {
+    const later: TMessage = {
+      ...user,
+      messageId: 'user-2',
+      parentMessageId: 'response-1',
+      text: 'And then?',
+    };
+    const stored = [user, reply('response-1', 'Hi'), later, reply('response-2', 'Then', 'user-2')];
+    const { result, streams, loadMessages, ready } = setup({ stored });
+    await ready();
+
+    act(() => {
+      result.current.contract.regenerate({
+        messageId: 'response-1',
+        parentMessageId: 'user-1',
+        isCreatedByUser: false,
+      });
+    });
+    await waitFor(() => expect(streams).toHaveLength(1));
+    /** While it runs, only the branch being rerun is on screen, as ask shows it. */
+    expect(ids(result.current.contract.getMessages())).not.toContain('response-2');
+
+    act(() => streams[0].push(final(user, reply('response-1b', 'Again'))));
+    await waitFor(() => expect(result.current.contract.isSubmitting).toBe(false));
+    await settle();
+
+    const settled = ids(result.current.contract.getMessages());
+    expect(settled).toEqual(
+      expect.arrayContaining(['user-1', 'response-1', 'user-2', 'response-2']),
+    );
+    expect(settled).toContain('response-1b');
+    expect(settled.some((id) => id.endsWith('_'))).toBe(false);
+    /** Restored from what the turn set aside, not by reading the conversation again. */
+    expect(loadMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a generation it did not start, on the endpoint the conversation runs on', async () => {
+    const { result, abort, streams, setStatus, rerender, ready } = setup();
+    await ready();
+    setStatus({ active: true, streamId: conversationId, createdAt: 2000 });
+    rerender({ live: true });
+    await waitFor(() => expect(streams).toHaveLength(1));
+    await settle();
+
+    let refusal: unknown;
+    await act(async () => {
+      result.current.contract.stopGenerating().catch((error: unknown) => {
+        refusal = error;
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(abort).toHaveBeenCalledTimes(1));
+    expect(refusal).toBeUndefined();
+    expect(abort.mock.calls[0]).toMatchObject([{ endpoint: EModelEndpoint.agents }]);
   });
 });

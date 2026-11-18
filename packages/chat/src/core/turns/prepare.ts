@@ -1,6 +1,15 @@
 import { createPayload } from 'librechat-data-provider';
-import type { TMessage, TSubmission } from 'librechat-data-provider';
+import type { TMessage, TSubmission, EventSubmission } from 'librechat-data-provider';
 import type { ChatPrepareRequest, ChatPreparedRequest } from '../chat';
+import type { TResData } from './types';
+import {
+  mergeErrorMessages,
+  toStartGenerationError,
+  getStreamStartFailureText,
+  mergeRegenerateFinalMessages,
+} from '../resumable';
+import { STREAM_START_FAILED_METADATA_KEY } from '../regenerate';
+import { resolveErrorTurn } from './errors';
 
 /**
  * A turn as main chat's `ask` leaves it: the submission the turn builder made, and the rows
@@ -48,4 +57,67 @@ export function prepareSubmittedTurn({ submission, messages }: SubmittedTurn): C
     messages,
     responseMessageId: submission.initialResponse?.messageId,
   };
+}
+
+/** The turn as the handlers that settle it take it: with the reply `ask` always builds. */
+const settling = ({ submission }: SubmittedTurn): EventSubmission | undefined =>
+  submission.initialResponse == null
+    ? undefined
+    : { ...submission, initialResponse: submission.initialResponse };
+
+/**
+ * The list a turn leaves when it failed for good: the rows main chat's error handler writes.
+ * A start the server refused leaves the turn's message with the refusal as its reply, marked as
+ * a start that failed so the next message answers past it; a failure the stream reported keeps
+ * what had streamed and takes the failure as its last part. `current` is the list as the
+ * failure left it. Nothing when the turn has no reply to carry the failure.
+ */
+export function failedTurnMessages(
+  turn: SubmittedTurn,
+  current: TMessage[],
+  error: Error | undefined,
+): TMessage[] | undefined {
+  const submission = settling(turn);
+  if (submission == null) {
+    return undefined;
+  }
+  const refused = toStartGenerationError(error)?.response;
+  const data =
+    refused == null
+      ? { text: error?.message ?? '' }
+      : {
+          text: getStreamStartFailureText(refused.data),
+          metadata: { [STREAM_START_FAILED_METADATA_KEY]: true },
+        };
+  const { errorResponse } = resolveErrorTurn({
+    data: data as unknown as TResData,
+    submission,
+    getMessages: () => current,
+    isNewConversationRoute: false,
+  });
+  return mergeErrorMessages({ ...submission, errorMessage: errorResponse });
+}
+
+/**
+ * The list a rerun leaves when its own stream ended it. While it ran, the list held only the
+ * branch being rerun: the reply it replaces and what followed that reply were set aside, as
+ * `ask` shows it. They are other branches of the same conversation, so they come back beside
+ * the new reply, as main chat's final handler puts them. Nothing for a turn that set none aside.
+ */
+export function rerunTurnMessages(
+  { submission }: SubmittedTurn,
+  response: TMessage | undefined,
+): TMessage[] | undefined {
+  const { regenerateMessages, initialResponse } = submission;
+  if (submission.isRegenerate !== true || regenerateMessages == null) {
+    return undefined;
+  }
+  if (response == null) {
+    return regenerateMessages.filter((message) => message.messageId !== initialResponse?.messageId);
+  }
+  return mergeRegenerateFinalMessages({
+    messages: regenerateMessages,
+    responseMessage: response,
+    initialResponseId: initialResponse?.messageId,
+  });
 }
